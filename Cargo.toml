@@ -1,0 +1,23 @@
+[package]
+name = "AstroImageCompressor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rawloader = "0.37.1"
+criterion = "0.5.1"
+bitvec = "1.0.1"
+rand = "0.9.0"
+num-traits = "0.2.19"
+sha2 = "0.10.8"
+flate2 = { version = "1.1.0"}
+anyhow = "1.0.97"
+exiftool = "0.2.3"
+serde_json = "1.0.140"
+
+[profile.dev]
+opt-level = 2
+
+[[bench]]
+name = "benchmarks"
+harness = false
