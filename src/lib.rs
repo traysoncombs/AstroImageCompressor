@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufReader, BufWriter, Write};
 use std::ops::{Deref, DerefMut};
 use bitvec::bitvec;
 use bitvec::field::BitField;
@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 use anyhow::{Result, anyhow, bail};
 use rawloader::{RawImage, RawImageData};
 use serde_json::{Map, Value};
+use tiff::decoder::DecodingResult;
+use tiff::encoder::colortype;
 // Pixels are variable size, up to 4 bits are used to specify the size of a pixel.
 // For images with less bit-depth fewer bits can be used.
 
@@ -19,7 +21,7 @@ type Bits = BitVec<u8, Msb0>;
 const MAGIC: u8 = 0xD6;
 const VERSION: u8 = 1;
 
-const EXIFTOOL: &str = "exiftool.exe";
+const EXIFTOOL: &str = "exiftool";
 
 /// This function compresses a single pixel and returns it representation as Bits.
 /// It works by computing base_pixel - to_compress, determining the maximum number
@@ -36,13 +38,12 @@ pub fn compress_pixel(
     size_width: usize,
 ) -> Bits {
     let difference = *base_pixel as i128 - *to_compress as i128;
-    let mut size: u8 = 0;
 
     if difference == 0 {
         return bitvec!(u8, Msb0; 0; size_width);
     }
 
-    size = *inverse_size_map.get(get_width(difference) as usize).unwrap();
+    let size = *inverse_size_map.get(get_width(difference) as usize).unwrap();
 
     let mut return_string = Bits::new();
     let mut size_bits = size.view_bits::<Msb0>();
@@ -186,64 +187,6 @@ pub fn decompress_metadata_json(base_data: &Map<String, Value>, to_decompress: &
     Ok(return_value)
 }
 
-pub fn get_pixel_data(img: &RawImage) -> Result<&Vec<u16>> {
-    match &img.data {
-        RawImageData::Integer(data) => Ok(data),
-        RawImageData::Float(_) => {
-            panic!("Can't decode image as float");
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct RawImageEq(RawImage);
-
-impl PartialEq<Self> for RawImageEq {
-    fn eq(&self, rhs: &Self) -> bool {
-        for i in 0..self.wb_coeffs.len() {
-            // NaN != NaN, I think RawImage has a parsing issue that is leading to sometimes being included in the wb_coeffs
-            // It doesn't matter too much in my case considering I'm not really using the field and the actual coeffs will be
-            // pulled from exiftool.
-            if self.wb_coeffs[i] != rhs.wb_coeffs[i] && !self.wb_coeffs[i].is_nan() && !rhs.wb_coeffs[i].is_nan() {
-                return false;
-            }
-        }
-
-        if !(self.model == rhs.model && self.make == rhs.make &&
-            self.blackareas == rhs.blackareas && self.crops == rhs.crops &&
-            self.whitelevels == rhs.whitelevels && self.width == rhs.width &&
-            self.height == rhs.height && self.cpp == rhs.cpp &&
-            self.xyz_to_cam == rhs.xyz_to_cam &&
-            self.cfa.name == rhs.cfa.name &&
-            self.orientation == rhs.orientation) {
-            return false
-        }
-
-        if get_pixel_data(self).unwrap() != get_pixel_data(rhs).unwrap() {
-            return false
-        }
-
-        true
-    }
-}
-
-impl Eq for RawImageEq {}
-
-impl Deref for RawImageEq {
-    type Target = RawImage;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for RawImageEq {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-
 #[derive(Eq, PartialEq, Debug)]
 pub struct CompressedFile {
     pub header: Header,
@@ -253,33 +196,53 @@ pub struct CompressedFile {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct UncompressedFile {
-    pub image: RawImageEq,
+    pub image: Vec<u16>,
     bit_depth: usize,
-    metadata: Map<String, Value>
+    metadata: Map<String, Value>,
+    size: (usize, usize),
 }
-
-pub struct UncompressedFileBatch([UncompressedFile]);
 
 impl UncompressedFile {
     pub fn new(path: &str, bit_depth: usize) -> Result<UncompressedFile> {
-        let image = rawloader::decode_file(path)?;
+        let image_file = File::open(path)?;
+        let reader = BufReader::new(image_file);
 
-        match &image.data {
-            RawImageData::Integer(_) => (),
-            RawImageData::Float(_) => bail!("Uncompressed file does not support float type"),
-        };
+        let mut tiff_file = tiff::decoder::Decoder::new(reader)?;
+
+        let mut buf = DecodingResult::U16(Vec::new());
+
+        tiff_file.read_image_to_buffer(&mut buf)?;
 
         // TODO: We need a way to retrieve the metadata in batch because it will be a good deal faster.
         let mut exiftool = exiftool::ExifTool::with_executable(EXIFTOOL.as_ref())?;
         // TODO: SLOW
         let metadata = exiftool.json(path.as_ref(), &["-b"])?.as_object().unwrap().clone();
 
+        let data = match buf {
+            DecodingResult::U16(vec) => vec,
+            _ => {
+                panic!("Can't decode image file");
+            }
+        };
+
+        let size = tiff_file.dimensions()?;
 
         Ok(UncompressedFile {
-            image: RawImageEq(image),
+            image: data,
             bit_depth,
-            metadata
+            metadata,
+            size: (size.0 as usize, size.1 as usize),
         })
+    }
+
+    pub fn write(&self, path: &str) -> Result<()> {
+        let file = File::create(path)?;
+        let writer = BufWriter::new(file);
+        let mut tiff_encoder = tiff::encoder::TiffEncoder::new(writer)?;
+
+        tiff_encoder.write_image::<colortype::Gray16>(self.size.0 as u32, self.size.1 as u32, &self.image)?;
+
+        Ok(())
     }
 }
 
@@ -290,10 +253,10 @@ impl CompressedFile {
             bail!("Error: Both images need to have the same bit depth and it needs to be at most 255.")
         }
 
-        let base_data = get_pixel_data(&base_image.image)?;
-        let to_compress_data = get_pixel_data(&to_compress.image)?;
+        let base_data = &base_image.image;
+        let to_compress_data = &to_compress.image;
 
-        let (avg, std) = compute_stats(base_data, to_compress_data);
+        let (avg, _) = compute_stats(base_data, to_compress_data);
         let (size_width, sizemap) = generate_parameters(base_image.bit_depth, get_width(avg as i128) as usize);
         let inverse_sizemap = generate_inverse_size_map(&sizemap);
 
@@ -306,7 +269,7 @@ impl CompressedFile {
 
     pub fn write(&self, path: &str) -> Result<()> {
         let mut f = File::create(path)?;
-        let c = flate2::Compression::new(6);
+        let c = flate2::Compression::default();
         flate2::write::DeflateEncoder::new(&mut f, c).write_all(&self.to_bytes())?;
 
         Ok(())
@@ -316,39 +279,18 @@ impl CompressedFile {
         let new_metadata = decompress_metadata_json(&base_image.metadata, &self.metadata)?;
 
         let decompressed_data = decompress_pixels(
-            get_pixel_data(&base_image.image)?,
+            &base_image.image,
             &self.data,
             base_image.bit_depth,
             &self.header.size_map,
             get_pixel_size(self.header.bit_depth) as usize
         );
 
-        let img_ref = &base_image.image;
-
-        // This is a lot faster than trying to clone the entire image...
-        let new_image = RawImage {
-            make: img_ref.make.clone(),
-            model: img_ref.model.clone(),
-            clean_make: img_ref.make.clone(),
-            clean_model: img_ref.clean_model.clone(),
-            width: img_ref.width,
-            height: img_ref.height,
-            cpp: img_ref.cpp,
-            wb_coeffs: img_ref.wb_coeffs.clone(),
-            whitelevels: img_ref.whitelevels.clone(),
-            blacklevels: img_ref.blacklevels.clone(),
-            xyz_to_cam: img_ref.xyz_to_cam.clone(),
-            cfa: img_ref.cfa.clone(),
-            crops: img_ref.crops.clone(),
-            blackareas: img_ref.blackareas.clone(),
-            orientation: img_ref.orientation.clone(),
-            data: RawImageData::Integer(decompressed_data),
-        };
-
         Ok(UncompressedFile {
-            image: RawImageEq(new_image),
+            image: decompressed_data,
             bit_depth: base_image.bit_depth,
             metadata: new_metadata,
+            size: base_image.size,
         })
 
     }
@@ -457,7 +399,7 @@ impl Header {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Header> {
         if bytes.len() != (35 + bytes[34]) as usize || bytes[0] != MAGIC {
-            anyhow!("Error: Invalid header");
+            bail!("Error: Invalid header")
         }
 
         Ok(Header {
@@ -518,7 +460,7 @@ pub fn generate_parameters(bit_depth: usize, avg_diff_bits: usize) -> (usize, Ve
     (size_width, sizemap)
 }
 
-fn generate_inverse_size_map(size_map: &Vec<u8>) -> Vec<u8> {
+pub fn generate_inverse_size_map(size_map: &Vec<u8>) -> Vec<u8> {
     let mut inverse: Vec<u8> = Vec::new();
     let mut j = 0;
     let mut i = 0;
@@ -571,7 +513,7 @@ pub fn get_width(value: i128) -> u8 {
         return 0;
     }
 
-    let mut positive = value.abs();
+    let positive = value.abs();
     let mut size = positive.ilog2() + 2;
 
     if positive.count_ones() == 1 && value.is_negative() {
@@ -715,8 +657,8 @@ mod tests {
 
     #[test]
     pub fn real_world_test() {
-        let base_image = UncompressedFile::new("data/2/1.NEF", 14).unwrap();
-        let to_compress = UncompressedFile::new("data/2/2.NEF", 14).unwrap();
+        let base_image = UncompressedFile::new("data/1/1.tif", 16).unwrap();
+        let to_compress = UncompressedFile::new("data/1/2.tif", 16).unwrap();
         let compressed = CompressedFile::from_uncompressed(&base_image, &to_compress).unwrap();
 
         let re_parsed = CompressedFile::from_bytes(&compressed.to_bytes()).unwrap();
@@ -725,7 +667,7 @@ mod tests {
         let decompressed = compressed.decompress(&base_image).unwrap();
 
         assert_eq!(decompressed, to_compress);
-        let uncompressed_size = (get_pixel_data(&to_compress.image).unwrap().len() * 2);
+        let uncompressed_size = ((&to_compress.image).len() * 2);
 
         println!("Compression Ratio: {:?}", compressed.data.len() as f32 / uncompressed_size as f32);
 

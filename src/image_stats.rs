@@ -7,7 +7,7 @@
 
 use num_traits::{abs, PrimInt, ToPrimitive};
 use rawloader::*;
-use AstroImageCompressor::get_width;
+use AstroImageCompressor::{generate_inverse_size_map, get_width};
 
 pub fn compute_image_stats(base_image: &RawImage, others: &[RawImage]) {
     let mut total_avg: f64 = 0f64;
@@ -110,49 +110,18 @@ pub fn compute_stats<T: PrimInt>(base_data: &[T], other: &[T]) -> (f64, f64) {
     (avg, (variance / (pixel_count as f64 - 1f64)).sqrt())
 }
 
-pub fn compute_best_possible_compression_ratio(base_image: &[u16], to_compress: &[u16]) {
+pub fn compute_best_possible_compression_ratio(base_image: &[u16], to_compress: &[u16], sizemap: &Vec<u8>, bit_depth: u8) {
     let mut sum = 0u64;
+    let overhead = sizemap.len().ilog2();
+    let inverse_size_map = generate_inverse_size_map(sizemap);
+
     for i in 0..base_image.len() {
         let diff = to_compress[i] as i128 - base_image[i] as i128;
-        sum += get_width(diff) as u64 + 3;
+        sum += sizemap[*inverse_size_map.get(get_width(diff) as usize).unwrap() as usize] as u64 + overhead as u64;
     }
 
     let compressed_bytes = sum as f32 / 8f32;
-    let uncompressed_bytes = (to_compress.len() as f32 * 14f32) / 8f32;
-
-    println!("Best possible compression ratio: {},", compressed_bytes / uncompressed_bytes);
-}
-
-pub fn compute_best_possible_compression_size_with_offset(
-    base_image: &[u16],
-    to_compress: &[u16],
-    width: isize,
-    height: isize,
-    dx: isize,
-    dy: isize
-) {
-    let mut sum = 0u64;
-    for y in 0..height {
-        for x in 0isize..width {
-            let base_pixel = base_image[(y * width + x) as usize];
-            let mut y_offset = y + dy;
-            let mut x_offset = x + dx;
-            if y_offset >= height || y_offset < 0  {
-                y_offset = y;
-            }
-
-            if x_offset >= width || x_offset < 0 {
-                x_offset = x;
-            }
-
-            let to_compress_pixel = to_compress[(y_offset * width + x_offset) as usize];
-            let diff = base_pixel as i128 - to_compress_pixel as i128;
-            sum += get_width(diff) as u64 + 3;
-        }
-    }
-
-    let compressed_bytes = sum as f64 / 8f64;
-    let uncompressed_bytes = (to_compress.len() as f64 * 14f64) / 8f64;
+    let uncompressed_bytes = (to_compress.len() as f32 * bit_depth as f32) / 8f32;
 
     println!("Best possible compression ratio: {},", compressed_bytes / uncompressed_bytes);
 }
